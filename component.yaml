@@ -1,0 +1,22 @@
+schemaVersion: 1.0
+phases:
+  - name: build
+    steps:
+      - name: InstallAnsibleAndGit
+        action: ExecuteBash
+        inputs:
+          commands:
+          - sudo amazon-linux-extras install -y ansible2
+          - sudo yum install -y git
+      - name: RunPlaybook
+        action: ExecuteBash
+        inputs:
+          commands:
+          - |
+            set -x
+            sudo su -l ec2-user -c '(
+            t=$(mktemp -d)
+            git clone https://github.com/whs-dot-hk/ansible-php-test.git $t
+            cd $t/
+            ansible-playbook -idefault, -clocal playbook.yaml
+            )'
