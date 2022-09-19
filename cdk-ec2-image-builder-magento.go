@@ -6,9 +6,15 @@ import (
 
 	"github.com/aws/aws-cdk-go/awscdk/v2"
 	// "github.com/aws/aws-cdk-go/awscdk/v2/awssqs"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awscloudtrail"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsiam"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsimagebuilder"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awskms"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awslambda"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awslogs"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awslogsdestinations"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awss3"
+	"github.com/aws/aws-cdk-go/awscdk/v2/customresources"
 	"github.com/aws/constructs-go/constructs/v10"
 	"github.com/aws/jsii-runtime-go"
 )
@@ -57,8 +63,46 @@ func NewCdkEc2ImageBuilderMagentoStack(scope constructs.Construct, id string, pr
 		},
 	})
 
-	bucket := awss3.NewBucket(stack, jsii.String("Bucket"), &awss3.BucketProps{
+	keyEc2ImageBuilder := awskms.NewKey(stack, jsii.String("KeyEC2ImageBuilder"), &awskms.KeyProps{
+		Policy: awsiam.NewPolicyDocument(&awsiam.PolicyDocumentProps{
+			Statements: &[]awsiam.PolicyStatement{
+				awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+					Actions: &[]*string{
+						jsii.String("kms:*"),
+					},
+					Principals: &[]awsiam.IPrincipal{
+						awsiam.NewAccountRootPrincipal(),
+					},
+					Resources: &[]*string{
+						jsii.String("*"),
+					},
+				}),
+				awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+					Actions: &[]*string{
+						jsii.String("kms:GenerateDataKey*"),
+					},
+					Conditions: &map[string]interface{}{
+						"StringEquals": map[string]*string{
+							"kms:CallerAccount": awscdk.Fn_Sub(jsii.String("${AWS::AccountId}"), nil),
+						},
+						"StringLike": map[string]*string{
+							"kms:EncryptionContext:aws:s3:arn": jsii.String("*"),
+						},
+					},
+					Principals: &[]awsiam.IPrincipal{
+						awsiam.NewAnyPrincipal(),
+					},
+					Resources: &[]*string{
+						jsii.String("*"),
+					},
+				}),
+			},
+		}),
+	})
+
+	bucket := awss3.NewBucket(stack, jsii.String("BucketEC2ImageBuilder"), &awss3.BucketProps{
 		BlockPublicAccess: awss3.BlockPublicAccess_BLOCK_ALL(),
+		EncryptionKey:     keyEc2ImageBuilder,
 	})
 
 	role := awsiam.NewRole(stack, jsii.String("Role"), &awsiam.RoleProps{
@@ -103,6 +147,159 @@ func NewCdkEc2ImageBuilderMagentoStack(scope constructs.Construct, id string, pr
 		InfrastructureConfigurationArn: infrastructureConfiguration.AttrArn(),
 		Name:                           jsii.String("magento"),
 		Status:                         jsii.String("DISABLED"),
+	})
+
+	keyCloudTrail := awskms.NewKey(stack, jsii.String("KeyCloudTrail"), &awskms.KeyProps{
+		Policy: awsiam.NewPolicyDocument(&awsiam.PolicyDocumentProps{
+			Statements: &[]awsiam.PolicyStatement{
+				awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+					Actions: &[]*string{
+						jsii.String("kms:*"),
+					},
+					Principals: &[]awsiam.IPrincipal{
+						awsiam.NewAccountRootPrincipal(),
+					},
+					Resources: &[]*string{
+						jsii.String("*"),
+					},
+				}),
+				awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+					Actions: &[]*string{
+						jsii.String("kms:GenerateDataKey*"),
+					},
+					Conditions: &map[string]interface{}{
+						"StringLike": map[string]*string{
+							"AWS:SourceArn": awscdk.Fn_Sub(jsii.String("arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/*"), nil),
+							"kms:EncryptionContext:aws:cloudtrail:arn": awscdk.Fn_Sub(jsii.String("arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*"), nil),
+						},
+					},
+					Principals: &[]awsiam.IPrincipal{
+						awsiam.NewServicePrincipal(jsii.String("cloudtrail.amazonaws.com"), nil),
+					},
+					Resources: &[]*string{
+						jsii.String("*"),
+					},
+				}),
+			},
+		}),
+	})
+
+	cloudtrail := awscloudtrail.NewTrail(stack, jsii.String("CloudTrail"), &awscloudtrail.TrailProps{
+		Bucket: awss3.NewBucket(stack, jsii.String("BucketCloudTrail"), &awss3.BucketProps{
+			BlockPublicAccess: awss3.BlockPublicAccess_BLOCK_ALL(),
+		}),
+		EncryptionKey:        keyCloudTrail,
+		SendToCloudWatchLogs: jsii.Bool(true),
+	})
+
+	lambda := awslambda.NewFunction(stack, jsii.String("Function"), &awslambda.FunctionProps{
+		Code:    awslambda.NewInlineCode(jsii.String("exports.handler = async () => { console.log('Image created!'); };")),
+		Handler: jsii.String("index.handler"),
+		Runtime: awslambda.Runtime_NODEJS_16_X(),
+	})
+
+	lambda.AddPermission(jsii.String("Permission"), &awslambda.Permission{
+		Principal: awsiam.NewServicePrincipal(jsii.String("logs.amazonaws.com"), nil),
+		Action:    jsii.String("lambda:InvokeFunction"),
+		SourceArn: cloudtrail.LogGroup().LogGroupArn(),
+	})
+
+	awslogs.NewSubscriptionFilter(stack, jsii.String("SubscriptionFilter"), &awslogs.SubscriptionFilterProps{
+		Destination:   awslogsdestinations.NewLambdaDestination(lambda, nil),
+		FilterPattern: awslogs.FilterPattern_All(awslogs.FilterPattern_StringValue(jsii.String("$.userAgent"), jsii.String("="), jsii.String("imagebuilder.amazonaws.com")), awslogs.FilterPattern_StringValue(jsii.String("$.eventName"), jsii.String("="), jsii.String("CreateImage"))),
+		LogGroup:      cloudtrail.LogGroup(),
+	})
+
+	customresources.NewAwsCustomResource(stack, jsii.String("CustomResourceKeyEc2ImageBuilder"), &customresources.AwsCustomResourceProps{
+		OnCreate: &customresources.AwsSdkCall{
+			Action:             jsii.String("putKeyPolicy"),
+			Service:            jsii.String("KMS"),
+			PhysicalResourceId: customresources.PhysicalResourceId_Of(jsii.String("custom-resource")),
+			Parameters: map[string]*string{
+				"KeyId":      keyEc2ImageBuilder.KeyId(),
+				"PolicyName": jsii.String("default"),
+				"Policy": awscdk.Fn_Sub(jsii.String(`{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+		"AWS": "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            },
+            "Action": "kms:*",
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "*"
+            },
+            "Action": "kms:GenerateDataKey*",
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+		    "kms:CallerAccount": "${AWS::AccountId}"
+                },
+                "StringLike": {
+		    "kms:EncryptionContext:aws:s3:arn": "${Arn}/*"
+                }
+            }
+        }
+    ]
+}`), &map[string]*string{
+					"Arn": bucket.BucketArn(),
+				}),
+			},
+		},
+		Policy: customresources.AwsCustomResourcePolicy_FromSdkCalls(&customresources.SdkCallsPolicyOptions{
+			Resources: customresources.AwsCustomResourcePolicy_ANY_RESOURCE(),
+		}),
+	})
+
+	customresources.NewAwsCustomResource(stack, jsii.String("CustomResourceKeyCloudTrail"), &customresources.AwsCustomResourceProps{
+		OnCreate: &customresources.AwsSdkCall{
+			Action:             jsii.String("putKeyPolicy"),
+			Service:            jsii.String("KMS"),
+			PhysicalResourceId: customresources.PhysicalResourceId_Of(jsii.String("custom-recource")),
+			Parameters: map[string]*string{
+				"KeyId":      keyCloudTrail.KeyId(),
+				"PolicyName": jsii.String("default"),
+				"Policy": awscdk.Fn_Sub(jsii.String(`{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+		"AWS": "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            },
+            "Action": "kms:*",
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "cloudtrail.amazonaws.com"
+            },
+            "Action": "kms:GenerateDataKey*",
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+		    "AWS:SourceArn": "${Arn}"
+                },
+                "StringLike": {
+		    "kms:EncryptionContext:aws:cloudtrail:arn": "arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*"
+                }
+            }
+        }
+    ]
+}`), &map[string]*string{
+					"Arn": cloudtrail.TrailArn(),
+				}),
+			},
+		},
+		Policy: customresources.AwsCustomResourcePolicy_FromSdkCalls(&customresources.SdkCallsPolicyOptions{
+			Resources: customresources.AwsCustomResourcePolicy_ANY_RESOURCE(),
+		}),
 	})
 
 	// example resource
